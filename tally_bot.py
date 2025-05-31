@@ -2,14 +2,13 @@ import discord
 from discord.ext import commands, tasks
 import os
 from dotenv import load_dotenv
-import aiohttp
-import json
 import requests
 from datetime import datetime, timezone
-import collections
 import asyncio
 import re
 import sqlite3
+import threading
+import time
 
 # Load environment variables
 load_dotenv()
@@ -18,8 +17,11 @@ load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
 PROPOSALS_CHANNEL_ID = int(os.getenv('PROPOSALS_CHANNEL_ID', 0))
-WORMHOLE_API_URL = 'https://w.wormhole.com/api/governance/proposals'
-LIVE_MODE = os.getenv('LIVE_MODE', 'false').lower() == 'true'
+
+# Tally API configuration
+TALLY_API_URL = "https://api.tally.xyz/query"
+TALLY_API_KEY = os.getenv("TALLY_API_KEY")
+WORMHOLE_ORG_ID = "2323517483434116775"  # Wormhole organization ID on Tally
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -51,10 +53,6 @@ def init_database():
 
 def load_announced_proposals():
     """Load previously announced proposals from database"""
-    if LIVE_MODE:
-        print("LIVE_MODE is enabled - ignoring database")
-        return set()
-        
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     
@@ -67,171 +65,369 @@ def load_announced_proposals():
 
 def save_announced_proposal(proposal):
     """Save an announced proposal to the database"""
-    if LIVE_MODE:
-        return  # Don't save to database in live mode
-        
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     
     cursor.execute('''
         INSERT OR REPLACE INTO announced_proposals (id, title, status, tally_id)
         VALUES (?, ?, ?, ?)
-    ''', (proposal.id, proposal.title, proposal.status, proposal.tally_id))
+    ''', (proposal.id, proposal.title, proposal.status, proposal.id))
     
     conn.commit()
     conn.close()
 
-class WormholeProposal:
+class TallyRateLimiter:
+    """Rate limiter for Tally API (1.1 seconds between requests)"""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_request = 0
+    
+    def wait_if_needed(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_request
+            if elapsed < 1.1:
+                time.sleep(1.1 - elapsed)
+            self.last_request = time.time()
+
+# Global rate limiter instance
+tally_rate_limiter = TallyRateLimiter()
+
+def fetch_wormhole_proposals_from_tally(limit=20, status_filter=None):
+    """Fetch Wormhole proposals directly from Tally API"""
+    tally_rate_limiter.wait_if_needed()
+    
+    query = """
+    query GovernanceProposals($input: ProposalsInput!) {
+      proposals(input: $input) {
+        nodes {
+          ... on Proposal {
+            id
+            onchainId
+            status
+            createdAt
+            metadata {
+              title
+              description
+            }
+            proposer {
+              address
+              name
+              ens
+            }
+            governor {
+              id
+              name
+              slug
+            }
+            start {
+              ... on Block {
+                timestamp
+              }
+              ... on BlocklessTimestamp {
+                timestamp
+              }
+            }
+            end {
+              ... on Block {
+                timestamp
+              }
+              ... on BlocklessTimestamp {
+                timestamp
+              }
+            }
+            block {
+              timestamp
+            }
+            voteStats {
+              votesCount
+              percent
+              type
+              votersCount
+            }
+          }
+        }
+        pageInfo {
+          firstCursor
+          lastCursor
+          count
+        }
+      }
+    }
+    """
+    
+    # Build filters
+    filters = {"organizationId": WORMHOLE_ORG_ID}
+    if status_filter:
+        filters["status"] = status_filter
+    
+    variables = {
+        "input": {
+            "filters": filters,
+            "sort": {
+                "sortBy": "id",
+                "isDescending": True
+            },
+            "page": {
+                "limit": limit
+            }
+        }
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Api-Key": TALLY_API_KEY
+    }
+    
+    try:
+        response = requests.post(
+            TALLY_API_URL,
+            json={"query": query, "variables": variables},
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if 'data' in result and 'proposals' in result['data']:
+                return result['data']['proposals']['nodes']
+    except Exception as e:
+        print(f"Error fetching proposals from Tally: {e}")
+    
+    return []
+
+class TallyProposal:
     def __init__(self, proposal_data):
         self.id = proposal_data.get('id')
-        self.tally_id = proposal_data.get('tally_id')
-        self.tally_url = proposal_data.get('tally_url')
-        self.title = proposal_data.get('title', 'N/A')
-        self.description = proposal_data.get('description', 'N/A')
-        self.status = proposal_data.get('status', 'N/A')
-        self.total_votes = proposal_data.get('total_votes', 0)
-        self.total_votes_for = proposal_data.get('total_votes_for', 0)
-        self.total_votes_against = proposal_data.get('total_votes_against', 0)
-        self.end_timestamp = proposal_data.get('end_timestamp', 0)
+        self.onchain_id = proposal_data.get('onchainId')
+        self.status = proposal_data.get('status', 'UNKNOWN')
+        self.created_at = proposal_data.get('createdAt')
+        
+        # Metadata
+        metadata = proposal_data.get('metadata', {})
+        base_title = metadata.get('title', 'N/A')
+        self.description = metadata.get('description', 'N/A')
+        
+        # Extract full title including WIP prefix if it exists in the description
+        # Look for patterns like "WIP-1: Title" at the start of description
+        title_with_prefix_match = re.match(r'^([A-Z0-9\-\s]+:\s*' + re.escape(base_title) + r')', self.description, re.IGNORECASE)
+        if title_with_prefix_match:
+            self.title = title_with_prefix_match.group(1).strip()
+        else:
+            self.title = base_title
+        
+        # Proposer info
+        proposer = proposal_data.get('proposer', {})
+        self.proposer_address = proposer.get('address')
+        self.proposer_name = proposer.get('name') or proposer.get('ens') or self._mask_address(self.proposer_address)
+        
+        # Governor info
+        governor = proposal_data.get('governor', {})
+        self.governor_name = governor.get('name', 'Wormhole')
+        # Force governor slug to 'wormhole' since Tally API returns 'wormhole-governor-1' 
+        # but the actual URL uses just 'wormhole'
+        self.governor_slug = 'wormhole'
+        
+        # Voting end time
+        end_block = proposal_data.get('end', {})
+        self.end_timestamp = end_block.get('timestamp')
+        
+        # Creation time (from block)
+        block = proposal_data.get('block', {})
+        self.block_timestamp = block.get('timestamp')
+        
+        # Vote statistics
+        self.vote_stats = proposal_data.get('voteStats', [])
+        
+        # Build Tally URL
+        self.tally_url = f"https://www.tally.xyz/gov/{self.governor_slug}/proposal/{self.id}"
+        
+        # Build proposer profile URL
+        if self.proposer_address:
+            self.proposer_url = f"https://www.tally.xyz/profile/{self.proposer_address}?governanceId={self.governor_slug}"
+
+    def _mask_address(self, address):
+        """Mask Ethereum address to format 0x1234...5678"""
+        if not address or len(address) < 10:
+            return address
+        return f"{address[:6]}...{address[-4:]}"
 
     @property
     def end_date(self):
         if self.end_timestamp:
-            return datetime.fromtimestamp(self.end_timestamp / 1000, tz=timezone.utc)
+            # Handle both millisecond timestamps and ISO date strings
+            if isinstance(self.end_timestamp, str):
+                return datetime.fromisoformat(self.end_timestamp.replace('Z', '+00:00'))
+            else:
+                return datetime.fromtimestamp(int(self.end_timestamp) / 1000, tz=timezone.utc)
+        return None
+
+    @property
+    def creation_date(self):
+        if self.block_timestamp:
+            # Handle both millisecond timestamps and ISO date strings
+            if isinstance(self.block_timestamp, str):
+                return datetime.fromisoformat(self.block_timestamp.replace('Z', '+00:00'))
+            else:
+                return datetime.fromtimestamp(int(self.block_timestamp) / 1000, tz=timezone.utc)
         return None
 
     @property
     def is_active(self):
-        # Consider proposals as active if they are pending, voting, or queued
-        return self.status in ['pending', 'voting', 'queued', 'active']
+        # Map Tally statuses to active ones (case-insensitive)
+        active_statuses = ['PENDING', 'ACTIVE', 'QUEUED']
+        return self.status.upper() in active_statuses
+
+    def get_vote_percentages(self):
+        """Calculate vote percentages from vote stats"""
+        for_votes = 0
+        against_votes = 0
+        abstain_votes = 0
+        total_votes = 0
+        
+        for stat in self.vote_stats:
+            vote_type = stat.get('type', '').upper()
+            votes = float(stat.get('votesCount', 0))
+            
+            if vote_type == 'FOR':
+                for_votes = votes
+            elif vote_type == 'AGAINST':
+                against_votes = votes
+            elif vote_type == 'ABSTAIN':
+                abstain_votes = votes
+            
+            total_votes += votes
+        
+        if total_votes == 0:
+            return 0, 0, 0
+        
+        for_percent = (for_votes / total_votes) * 100
+        against_percent = (against_votes / total_votes) * 100
+        abstain_percent = (abstain_votes / total_votes) * 100
+        
+        return for_percent, against_percent, abstain_percent
 
     def extract_abstract(self):
         """Extract abstract from description or return truncated description"""
-        # Remove any HTML/markdown formatting
-        clean_text = re.sub(r'<[^>]+>', '', self.description)  # Remove HTML tags
-        clean_text = re.sub(r'\*{1,2}([^\*]+)\*{1,2}', r'\1', clean_text)  # Remove bold/italic
-        clean_text = re.sub(r'#+\s*', '', clean_text)  # Remove headers
-        clean_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_text)  # Remove links
-        clean_text = re.sub(r'\n\s*\n', '\n', clean_text)  # Remove multiple newlines
-        clean_text = clean_text.strip()
-
-        # Remove the title if it appears at the beginning of the description
+        # Start with the raw description
+        clean_text = self.description.strip()
+        
+        # Remove the full title from the beginning of the description
+        # Since self.title now includes the WIP prefix, we can do a simple removal
         if clean_text.startswith(self.title):
             clean_text = clean_text[len(self.title):].strip()
-
-        # Remove common header patterns at the beginning of lines
-        header_patterns = [
-            r'^(?:Abstract|ABSTRACT|Summary|SUMMARY|Description|DESCRIPTION|Title|TITLE|Overview|OVERVIEW):?\s*\n?',
-            r'\n(?:Abstract|ABSTRACT|Summary|SUMMARY|Description|DESCRIPTION|Title|TITLE|Overview|OVERVIEW):?\s*\n?',
-        ]
-
-        for pattern in header_patterns:
-            clean_text = re.sub(pattern, '\n', clean_text, flags=re.MULTILINE | re.IGNORECASE)
-
-        # Clean up any resulting multiple newlines or spaces
-        clean_text = re.sub(r'\n\s*\n', '\n', clean_text)
-        clean_text = re.sub(r'^\s+', '', clean_text)
+        
+        # Also check case-insensitive
+        if clean_text.lower().startswith(self.title.lower()):
+            clean_text = clean_text[len(self.title):].strip()
+        
+        # Split into lines and filter out any line containing the title
+        lines = clean_text.split('\n')
+        filtered_lines = []
+        title_lower = self.title.lower()
+        
+        for line in lines:
+            # Skip any line that contains the title (case-insensitive)
+            if title_lower in line.lower():
+                continue
+            filtered_lines.append(line)
+        
+        # Rejoin the filtered lines
+        clean_text = '\n'.join(filtered_lines).strip()
+        
+        # Remove markdown headers that contain keywords like Abstract, TL;DR, etc.
+        header_keywords = r'(?:Abstract|Summary|Overview|TL;?DR|Introduction|Description|Proposal|Background|Context|Rationale|Motivation|Purpose)'
+        
+        # Remove markdown headers with these keywords (e.g., "## Abstract", "# TL;DR")
+        clean_text = re.sub(r'^#{1,6}\s*' + header_keywords + r'\s*:?\s*$', '', clean_text, flags=re.IGNORECASE | re.MULTILINE)
+        
+        # Remove these keywords when they appear at the start of a line followed by a colon
+        clean_text = re.sub(r'^' + header_keywords + r'\s*:\s*', '', clean_text, flags=re.IGNORECASE | re.MULTILINE)
+        
+        # Now remove markdown formatting but preserve the text
+        clean_text = re.sub(r'#{1,6}\s+', '', clean_text)  # Remove header markers
+        clean_text = re.sub(r'\*{1,2}([^\*]+)\*{1,2}', r'\1', clean_text)  # Remove bold/italic
+        clean_text = re.sub(r'<[^>]+>', '', clean_text)  # Remove HTML tags
+        clean_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_text)  # Convert links to text
+        
+        # Clean up whitespace
+        clean_text = re.sub(r'\n\s*\n', '\n', clean_text)  # Remove empty lines
+        clean_text = re.sub(r'\n+', ' ', clean_text)  # Replace newlines with spaces
+        clean_text = re.sub(r'\s+', ' ', clean_text)  # Replace multiple spaces with single space
         clean_text = clean_text.strip()
-
-        # Try to find abstract section content (after removing headers)
-        abstract_patterns = [
-            # Look for content that might be in an abstract section
-            r'(?:^|\n)(.*?)(?:\n(?:[A-Z][a-z]+\s*[A-Z][a-z]+:|#{1,3}|\*{2})|$)',
-        ]
-
-        for pattern in abstract_patterns:
-            match = re.search(pattern, clean_text, re.DOTALL)
-            if match:
-                abstract = match.group(1).strip()
-                if abstract and len(abstract) > 50:  # Make sure we have meaningful content
-                    clean_text = abstract
-                    break
-
-        # Enforce 280 character limit with "..." ending
-        if len(clean_text) > 280:
-            return clean_text[:277] + "..."
-        elif len(clean_text) == 280:
-            return clean_text[:277] + "..."
+        
+        # Ensure exactly 280 characters with "..." at the end
+        # 277 characters for content + 3 for "..."
+        if len(clean_text) > 277:
+            # Find a good break point (space) before character 277
+            truncated = clean_text[:277]
+            last_space = truncated.rfind(' ')
+            if last_space > 200:  # Only use space break if it's not too far back
+                truncated = truncated[:last_space]
+            return truncated + "..."
         else:
-            # If text is shorter than 280, still add "..." if it seems truncated
-            if len(self.description) > len(clean_text):
-                return clean_text + "..."
-            return clean_text
+            # If text is shorter than 277 chars, still add "..."
+            return clean_text + "..."
 
     def create_embed(self):
         """Create a Discord embed for the proposal"""
-        # Use darker background color similar to Discord dark theme
+        # Determine embed color based on status
+        # Using custom purple color
+        color = discord.Color(0xB291DE)  # Purple hex color
+
+        # Create the embed without description initially
         embed = discord.Embed(
             title=self.title,
-            color=0x2b2d31,  # Discord dark gray
-            url=self.tally_url
+            url=self.tally_url,
+            color=color
         )
 
-        # Calculate voting ends time first (we'll need it for the header fields)
+        # Add author field with masked link
+        if self.proposer_address:
+            author_text = f"[{self.proposer_name}]({self.proposer_url})"
+        else:
+            author_text = self.proposer_name
+        embed.add_field(name="Author", value=author_text, inline=True)
+
+        # Add voting end date
         if self.end_date:
-            # Format the end date in MM/DD/YYYY HH:MM UTC
-            time_str = self.end_date.strftime("%m/%d/%Y %H:%M UTC")
+            end_str = self.end_date.strftime("%m/%d/%Y %H:%M UTC")
         else:
-            time_str = "Unknown"
+            end_str = "N/A"
+        embed.add_field(name="Voting Ends", value=end_str, inline=True)
 
-        # Add author, status, and voting ends as inline fields at the top
-        embed.add_field(name="Author", value="Governor2 (Placeholder)", inline=True)
-        embed.add_field(name="Voting Ends", value=time_str, inline=True)
-        embed.add_field(name="Status", value=self.status.capitalize(), inline=True)
+        # Add status
+        status_display = self.status.title() if self.status else "Unknown"
+        embed.add_field(name="Status", value=status_display, inline=True)
 
-        # Add description section
-        abstract = self.extract_abstract()
-        embed.add_field(name="Description", value=abstract, inline=False)
+        # Add description as a field
+        description_text = self.extract_abstract()
+        embed.add_field(name="Description", value=description_text, inline=False)
 
-        # Calculate voting percentages and abstain votes
-        if self.total_votes > 0:
-            for_percentage = (self.total_votes_for / self.total_votes) * 100
-            against_percentage = (self.total_votes_against / self.total_votes) * 100
-            # Calculate abstain votes
-            abstain_votes = self.total_votes - self.total_votes_for - self.total_votes_against
-            abstain_percentage = (abstain_votes / self.total_votes) * 100
-        else:
-            for_percentage = against_percentage = abstain_percentage = 0
-            abstain_votes = 0
+        # Add voting progress
+        for_percent, against_percent, abstain_percent = self.get_vote_percentages()
+        
+        # Create visual bars with 10 squares each
+        def create_bar(percentage, filled_emoji):
+            filled_count = round(percentage / 10)  # Each square represents 10%
+            empty_count = 10 - filled_count
+            return filled_emoji * filled_count + "⬜" * empty_count
+        
+        voting_text = f"{create_bar(for_percent, '🟩')}  –  {for_percent:.1f}% FOR\n"
+        voting_text += f"{create_bar(against_percent, '🟥')}  –  {against_percent:.1f}% AGAINST\n"
+        voting_text += f"{create_bar(abstain_percent, '🟨')}  –  {abstain_percent:.1f}% ABSTAIN"
+        
+        embed.add_field(name="Voting", value=voting_text, inline=False)
 
-        # Create voting visualization with colored bars
-        voting_viz = ""
-        if self.total_votes > 0:
-            # Green bar for FOR votes
-            for_blocks = int(for_percentage / 10)  # Each block represents 10%
-            for_empty = 10 - for_blocks
-            voting_viz += "🟩" * for_blocks + "⬜" * for_empty
-            # Use non-breaking space and en dash for cleaner formatting
-            voting_viz += f"\u00A0\u00A0–\u00A0{for_percentage:5.1f}%\u00A0FOR\n"
-            
-            # Red bar for AGAINST votes
-            against_blocks = int(against_percentage / 10)
-            against_empty = 10 - against_blocks
-            voting_viz += "🟥" * against_blocks + "⬜" * against_empty
-            # Use non-breaking space and en dash for cleaner formatting
-            voting_viz += f"\u00A0\u00A0–\u00A0{against_percentage:5.1f}%\u00A0AGAINST\n"
-            
-            # Yellow/orange bar for ABSTAIN votes
-            abstain_blocks = int(abstain_percentage / 10)
-            abstain_empty = 10 - abstain_blocks
-            voting_viz += "🟨" * abstain_blocks + "⬜" * abstain_empty
-            # Use non-breaking space and en dash for cleaner formatting
-            voting_viz += f"\u00A0\u00A0–\u00A0{abstain_percentage:5.1f}%\u00A0ABSTAIN"
-        else:
-            voting_viz = "No votes recorded yet"
-
-        # Add voting visualization as non-inline field for full width
-        embed.add_field(name="Voting", value=voting_viz, inline=False)
-
-        # Add proposal ID as footer
-        embed.set_footer(text=f"Proposal ID: {self.id}")
+        # Set footer with creation date
+        if self.creation_date:
+            created_str = self.creation_date.strftime("%m/%d/%Y %H:%M UTC")
+            embed.set_footer(text=f"Created: {created_str}")
         
         return embed
 
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
-    print(f'LIVE_MODE: {LIVE_MODE}')
     
     # Initialize database
     init_database()
@@ -240,22 +436,14 @@ async def on_ready():
     global announced_proposals
     announced_proposals = load_announced_proposals()
     
-    check_new_proposals.start()
+    # Start checking for new proposals
+    if not check_new_proposals.is_running():
+        check_new_proposals.start()
 
 async def fetch_wormhole_proposals():
-    """Fetch proposals from Wormhole API"""
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(WORMHOLE_API_URL) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get('proposals', [])
-                else:
-                    print(f"Error fetching proposals: {response.status}")
-                    return []
-        except Exception as e:
-            print(f"Error fetching proposals: {e}")
-            return []
+    """Wrapper to fetch proposals asynchronously"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fetch_wormhole_proposals_from_tally)
 
 @tasks.loop(minutes=5)
 async def check_new_proposals():
@@ -266,11 +454,11 @@ async def check_new_proposals():
         return
 
     proposals = await fetch_wormhole_proposals()
-    print(f"Found {len(proposals)} total proposals")
+    print(f"Found {len(proposals)} total proposals from Tally")
 
     new_proposals = []
     for proposal_data in proposals:
-        proposal = WormholeProposal(proposal_data)
+        proposal = TallyProposal(proposal_data)
 
         # Only announce active proposals that haven't been announced yet
         if proposal.is_active and proposal.id not in announced_proposals:
@@ -291,7 +479,7 @@ async def check_new_proposals():
 async def list_proposals(ctx):
     """List all active proposals"""
     proposals = await fetch_wormhole_proposals()
-    active_proposals = [WormholeProposal(p) for p in proposals if WormholeProposal(p).is_active]
+    active_proposals = [TallyProposal(p) for p in proposals if TallyProposal(p).is_active]
 
     if not active_proposals:
         await ctx.send("No active proposals found.")
@@ -312,7 +500,7 @@ async def get_proposal(ctx, proposal_id: str):
 
     for proposal_data in proposals:
         if proposal_data.get('id') == proposal_id:
-            proposal = WormholeProposal(proposal_data)
+            proposal = TallyProposal(proposal_data)
             embed = proposal.create_embed()
             await ctx.send(embed=embed)
             return
@@ -323,10 +511,6 @@ async def get_proposal(ctx, proposal_id: str):
 @commands.has_permissions(administrator=True)
 async def clear_database(ctx):
     """Clear the announced proposals database (admin only)"""
-    if LIVE_MODE:
-        await ctx.send("Database operations are disabled in LIVE_MODE")
-        return
-        
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute('DELETE FROM announced_proposals')
@@ -341,10 +525,6 @@ async def clear_database(ctx):
 @bot.command(name='db_stats')
 async def database_stats(ctx):
     """Show database statistics"""
-    if LIVE_MODE:
-        await ctx.send("Database is disabled in LIVE_MODE")
-        return
-        
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     
@@ -361,7 +541,6 @@ async def database_stats(ctx):
     
     embed = discord.Embed(
         title="Database Statistics",
-        description=f"LIVE_MODE: {LIVE_MODE}",
         color=discord.Color.blue()
     )
     embed.add_field(name="Total Announced", value=total_count, inline=True)
@@ -372,4 +551,9 @@ async def database_stats(ctx):
 
 # Run the bot
 if __name__ == "__main__":
+    if not TALLY_API_KEY:
+        print("ERROR: TALLY_API_KEY not found in environment variables!")
+        print("Please add your Tally API key to the .env file")
+        exit(1)
+    
     bot.run(TOKEN)
