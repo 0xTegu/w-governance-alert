@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import collections
 import asyncio
 import re
+import sqlite3
 
 # Load environment variables
 load_dotenv()
@@ -18,6 +19,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
 PROPOSALS_CHANNEL_ID = int(os.getenv('PROPOSALS_CHANNEL_ID', 0))
 WORMHOLE_API_URL = 'https://w.wormhole.com/api/governance/proposals'
+LIVE_MODE = os.getenv('LIVE_MODE', 'false').lower() == 'true'
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -25,6 +27,59 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Store announced proposal IDs to avoid duplicates
 announced_proposals = set()
+
+# Database setup
+DATABASE_FILE = 'announced_proposals.db'
+
+def init_database():
+    """Initialize the database for tracking announced proposals"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS announced_proposals (
+            id TEXT PRIMARY KEY,
+            announced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            title TEXT,
+            status TEXT,
+            tally_id TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def load_announced_proposals():
+    """Load previously announced proposals from database"""
+    if LIVE_MODE:
+        print("LIVE_MODE is enabled - ignoring database")
+        return set()
+        
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT id FROM announced_proposals')
+    proposals = {row[0] for row in cursor.fetchall()}
+    
+    conn.close()
+    print(f"Loaded {len(proposals)} previously announced proposals from database")
+    return proposals
+
+def save_announced_proposal(proposal):
+    """Save an announced proposal to the database"""
+    if LIVE_MODE:
+        return  # Don't save to database in live mode
+        
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT OR REPLACE INTO announced_proposals (id, title, status, tally_id)
+        VALUES (?, ?, ?, ?)
+    ''', (proposal.id, proposal.title, proposal.status, proposal.tally_id))
+    
+    conn.commit()
+    conn.close()
 
 class WormholeProposal:
     def __init__(self, proposal_data):
@@ -105,52 +160,86 @@ class WormholeProposal:
 
     def create_embed(self):
         """Create a Discord embed for the proposal"""
-        # Use purple/violet color similar to the image
+        # Use darker background color similar to Discord dark theme
         embed = discord.Embed(
             title=self.title,
-            color=0x8B5CF6,  # Purple/violet color
+            color=0x2b2d31,  # Discord dark gray
             url=self.tally_url
         )
 
-        # Add description (abstract only)
+        # Calculate voting ends time first (we'll need it for the header fields)
+        if self.end_date:
+            # Format the end date in MM/DD/YYYY HH:MM UTC
+            time_str = self.end_date.strftime("%m/%d/%Y %H:%M UTC")
+        else:
+            time_str = "Unknown"
+
+        # Add author, status, and voting ends as inline fields at the top
+        embed.add_field(name="Author", value="Governor2 (Placeholder)", inline=True)
+        embed.add_field(name="Voting Ends", value=time_str, inline=True)
+        embed.add_field(name="Status", value=self.status.capitalize(), inline=True)
+
+        # Add description section
         abstract = self.extract_abstract()
         embed.add_field(name="Description", value=abstract, inline=False)
 
-        # Add status and voting info in a grid-like format
-        embed.add_field(name="Status", value=self.status.capitalize(), inline=True)
-        embed.add_field(name="Votes For", value=f"{self.total_votes_for:,.2f}", inline=True)
-        embed.add_field(name="Votes Against", value=f"{self.total_votes_against:,.2f}", inline=True)
+        # Calculate voting percentages and abstain votes
+        if self.total_votes > 0:
+            for_percentage = (self.total_votes_for / self.total_votes) * 100
+            against_percentage = (self.total_votes_against / self.total_votes) * 100
+            # Calculate abstain votes
+            abstain_votes = self.total_votes - self.total_votes_for - self.total_votes_against
+            abstain_percentage = (abstain_votes / self.total_votes) * 100
+        else:
+            for_percentage = against_percentage = abstain_percentage = 0
+            abstain_votes = 0
 
-        if self.end_date:
-            now = datetime.now(timezone.utc)
-            if self.end_date < now:
-                # Calculate how long ago it ended
-                time_diff = now - self.end_date
-                hours_ago = int(time_diff.total_seconds() / 3600)
-                if hours_ago < 24:
-                    time_str = f"{hours_ago} hours ago"
-                else:
-                    days_ago = hours_ago // 24
-                    time_str = f"{days_ago} days ago"
-                embed.add_field(name="Voting Ends", value=time_str, inline=False)
-            else:
-                # Show relative time until voting ends
-                embed.add_field(
-                    name="Voting Ends",
-                    value=f"<t:{int(self.end_timestamp / 1000)}:R>",
-                    inline=False
-                )
+        # Create voting visualization with colored bars
+        voting_viz = ""
+        if self.total_votes > 0:
+            # Green bar for FOR votes
+            for_blocks = int(for_percentage / 10)  # Each block represents 10%
+            for_empty = 10 - for_blocks
+            voting_viz += "🟩" * for_blocks + "⬜" * for_empty
+            # Use non-breaking space and en dash for cleaner formatting
+            voting_viz += f"\u00A0\u00A0–\u00A0{for_percentage:5.1f}%\u00A0FOR\n"
+            
+            # Red bar for AGAINST votes
+            against_blocks = int(against_percentage / 10)
+            against_empty = 10 - against_blocks
+            voting_viz += "🟥" * against_blocks + "⬜" * against_empty
+            # Use non-breaking space and en dash for cleaner formatting
+            voting_viz += f"\u00A0\u00A0–\u00A0{against_percentage:5.1f}%\u00A0AGAINST\n"
+            
+            # Yellow/orange bar for ABSTAIN votes
+            abstain_blocks = int(abstain_percentage / 10)
+            abstain_empty = 10 - abstain_blocks
+            voting_viz += "🟨" * abstain_blocks + "⬜" * abstain_empty
+            # Use non-breaking space and en dash for cleaner formatting
+            voting_viz += f"\u00A0\u00A0–\u00A0{abstain_percentage:5.1f}%\u00A0ABSTAIN"
+        else:
+            voting_viz = "No votes recorded yet"
 
+        # Add voting visualization as non-inline field for full width
+        embed.add_field(name="Voting", value=voting_viz, inline=False)
+
+        # Add proposal ID as footer
         embed.set_footer(text=f"Proposal ID: {self.id}")
-        
-        # Add Wormhole logo as thumbnail
-        embed.set_thumbnail(url="https://wormhole.com/images/wormhole-logo.png")
         
         return embed
 
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
+    print(f'LIVE_MODE: {LIVE_MODE}')
+    
+    # Initialize database
+    init_database()
+    
+    # Load previously announced proposals
+    global announced_proposals
+    announced_proposals = load_announced_proposals()
+    
     check_new_proposals.start()
 
 async def fetch_wormhole_proposals():
@@ -187,6 +276,7 @@ async def check_new_proposals():
         if proposal.is_active and proposal.id not in announced_proposals:
             new_proposals.append(proposal)
             announced_proposals.add(proposal.id)
+            save_announced_proposal(proposal)  # Save to database
 
     if new_proposals:
         print(f"Found {len(new_proposals)} new active proposals to announce")
@@ -228,6 +318,57 @@ async def get_proposal(ctx, proposal_id: str):
             return
 
     await ctx.send(f"Proposal with ID {proposal_id} not found.")
+
+@bot.command(name='clear_db')
+@commands.has_permissions(administrator=True)
+async def clear_database(ctx):
+    """Clear the announced proposals database (admin only)"""
+    if LIVE_MODE:
+        await ctx.send("Database operations are disabled in LIVE_MODE")
+        return
+        
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM announced_proposals')
+    conn.commit()
+    conn.close()
+    
+    global announced_proposals
+    announced_proposals = set()
+    
+    await ctx.send("Announced proposals database has been cleared.")
+
+@bot.command(name='db_stats')
+async def database_stats(ctx):
+    """Show database statistics"""
+    if LIVE_MODE:
+        await ctx.send("Database is disabled in LIVE_MODE")
+        return
+        
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) FROM announced_proposals')
+    total_count = cursor.fetchone()[0]
+    
+    cursor.execute('''
+        SELECT COUNT(*) FROM announced_proposals 
+        WHERE date(announced_at) = date('now')
+    ''')
+    today_count = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    embed = discord.Embed(
+        title="Database Statistics",
+        description=f"LIVE_MODE: {LIVE_MODE}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Total Announced", value=total_count, inline=True)
+    embed.add_field(name="Announced Today", value=today_count, inline=True)
+    embed.add_field(name="In Memory", value=len(announced_proposals), inline=True)
+    
+    await ctx.send(embed=embed)
 
 # Run the bot
 if __name__ == "__main__":

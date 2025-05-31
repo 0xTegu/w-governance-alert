@@ -23,3 +23,7 @@ ENV/
 # Logs
 *.log
 logs/
+
+# Database
+announced_proposals.db
+*.db

@@ -12,6 +12,8 @@ A Discord bot that monitors Wormhole governance proposals and sends alerts to a 
 - 🔗 Direct links to view proposals on Tally
 - 🎯 Commands to list active proposals and check specific proposals
 - 👤 Optional Tally API integration for additional proposal details (proposer info, creation date)
+- 💾 Database tracking to prevent re-announcing proposals on restart
+- 🔄 Live mode toggle for different announcement behaviors
 
 ## Requirements
 
@@ -48,6 +50,9 @@ PROPOSALS_CHANNEL_ID=your_channel_id_here
 # Tally API Configuration (Optional)
 # Get your API key from https://www.tally.xyz/user/settings
 TALLY_API_KEY=your_tally_api_key_here
+
+# LIVE_MODE Settings
+LIVE_MODE=false  # Set to true to announce all active proposals on startup
 ```
 
 ## Bot Setup
@@ -72,6 +77,12 @@ To enable this feature:
 
 The bot will work without a Tally API key, but with limited features.
 
+## LIVE_MODE Settings
+
+- **`LIVE_MODE=false` (default)**: The bot tracks announced proposals in a SQLite database and only announces new proposals that haven't been announced before. This prevents re-announcing proposals when the bot restarts.
+
+- **`LIVE_MODE=true`**: The bot announces all active proposals on startup, ignoring the database. Use this mode if you want to re-announce all active proposals every time the bot starts.
+
 ## Usage
 
 Run the bot:
@@ -88,6 +99,8 @@ The bot will:
 
 - `!proposals` - List all active governance proposals
 - `!proposal <number>` - Get details about a specific proposal (use the number from the proposals list)
+- `!db_stats` - Show database statistics (total announced proposals, today's count)
+- `!clear_db` - Clear the announced proposals database (admin only, disabled in LIVE_MODE)
 
 ## Proposal Status Colors
 
@@ -95,6 +108,17 @@ The bot will:
 - 🟡 Pending/Queued - Yellow  
 - 🔴 Defeated/Canceled - Red
 - ⚫ Other - Default
+
+## Database
+
+The bot uses a SQLite database (`announced_proposals.db`) to track which proposals have been announced. This database is automatically created on first run and is ignored by git.
+
+The database stores:
+- Proposal ID
+- Announcement timestamp
+- Proposal title
+- Proposal status
+- Tally ID
 
 ## Bot Architecture
 
