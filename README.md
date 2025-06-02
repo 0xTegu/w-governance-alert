@@ -43,17 +43,23 @@ git clone <repository-url>
 cd w-governance-alert
 ```
 
-2. Install dependencies:
+2. Create and activate a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate
+```
+
+3. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Copy `.env.example` to `.env`:
+4. Copy `.env.example` to `.env`:
 ```bash
 cp .env.example .env
 ```
 
-4. Configure your `.env` file:
+5. Configure your `.env` file:
 ```
 # Discord Bot Configuration (Required)
 DISCORD_TOKEN=your_discord_bot_token_here
