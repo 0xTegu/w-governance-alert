@@ -13,10 +13,15 @@ import time
 # Load environment variables
 load_dotenv()
 
+# Configure SQLite to handle datetime properly
+sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
+sqlite3.register_converter("timestamp", lambda b: datetime.fromisoformat(b.decode()))
+
 # Bot configuration
 TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
 PROPOSALS_CHANNEL_ID = int(os.getenv('PROPOSALS_CHANNEL_ID', 0))
+SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', 5))  # Default to 5 minutes
 
 # Tally API configuration
 TALLY_API_URL = "https://api.tally.xyz/query"
@@ -24,14 +29,24 @@ TALLY_API_KEY = os.getenv("TALLY_API_KEY")
 WORMHOLE_ORG_ID = "2323517483434116775"  # Wormhole organization ID on Tally
 
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+intents.message_content = True  # Enable message content intent
+bot = commands.Bot(command_prefix='/', intents=intents)
 
 # Store announced proposal IDs to avoid duplicates
 announced_proposals = set()
 
 # Database setup
 DATABASE_FILE = 'announced_proposals.db'
+
+# Define final proposal statuses that halt synchronization
+FINAL_PROPOSAL_STATUSES = [
+    'CANCELED',
+    'DEFEATED',
+    'EXECUTED',
+    'EXPIRED',
+    'SUCCEEDED',
+    'CROSSCHAINEXECUTED'
+]
 
 def init_database():
     """Initialize the database for tracking announced proposals"""
@@ -44,9 +59,21 @@ def init_database():
             announced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             title TEXT,
             status TEXT,
-            tally_id TEXT
+            tally_id TEXT,
+            discord_message_id TEXT,
+            last_sync_at TIMESTAMP
         )
     ''')
+    
+    # Add new columns if they don't exist (for migration)
+    cursor.execute("PRAGMA table_info(announced_proposals)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'discord_message_id' not in columns:
+        cursor.execute('ALTER TABLE announced_proposals ADD COLUMN discord_message_id TEXT')
+    
+    if 'last_sync_at' not in columns:
+        cursor.execute('ALTER TABLE announced_proposals ADD COLUMN last_sync_at TIMESTAMP')
     
     conn.commit()
     conn.close()
@@ -69,12 +96,63 @@ def save_announced_proposal(proposal):
     cursor = conn.cursor()
     
     cursor.execute('''
-        INSERT OR REPLACE INTO announced_proposals (id, title, status, tally_id)
-        VALUES (?, ?, ?, ?)
-    ''', (proposal.id, proposal.title, proposal.status, proposal.id))
+        INSERT OR REPLACE INTO announced_proposals (id, title, status, tally_id, discord_message_id, last_sync_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (proposal.id, proposal.title, proposal.status, proposal.id, 
+          getattr(proposal, 'discord_message_id', None), 
+          datetime.now(timezone.utc) if hasattr(proposal, 'discord_message_id') and proposal.discord_message_id else None))
     
     conn.commit()
     conn.close()
+
+def load_proposals_for_sync():
+    """Load proposals that need syncing (ACTIVE status with discord_message_id)"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT id, discord_message_id, status 
+        FROM announced_proposals 
+        WHERE discord_message_id IS NOT NULL
+    ''')
+    
+    proposals_to_sync = {}
+    for row in cursor.fetchall():
+        proposals_to_sync[row[0]] = {
+            'discord_message_id': row[1],
+            'last_status': row[2]
+        }
+    
+    conn.close()
+    return proposals_to_sync
+
+def update_proposal_sync_status(proposal_id, status):
+    """Update the sync timestamp and status for a proposal"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE announced_proposals 
+        SET last_sync_at = ?, status = ?
+        WHERE id = ?
+    ''', (datetime.now(timezone.utc), status, proposal_id))
+    
+    conn.commit()
+    conn.close()
+
+async def update_proposal_embed(channel, message_id, proposal):
+    """Update an existing Discord embed with new proposal data"""
+    try:
+        message = await channel.fetch_message(int(message_id))
+        new_embed = proposal.create_embed()
+        await message.edit(embed=new_embed)
+        return True
+    except discord.NotFound:
+        print(f"Message {message_id} not found for proposal {proposal.id}")
+        return False
+    except Exception as e:
+        print(f"Error updating message {message_id}: {e}")
+        return False
 
 class TallyRateLimiter:
     """Rate limiter for Tally API (1.1 seconds between requests)"""
@@ -245,6 +323,10 @@ class TallyProposal:
         if self.proposer_address:
             self.proposer_url = f"https://www.tally.xyz/profile/{self.proposer_address}?governanceId={self.governor_slug}"
 
+        # Initialize discord_message_id and last_sync_at
+        self.discord_message_id = None
+        self.last_sync_at = None
+
     def _mask_address(self, address):
         """Mask Ethereum address to format 0x1234...5678"""
         if not address or len(address) < 10:
@@ -273,9 +355,14 @@ class TallyProposal:
 
     @property
     def is_active(self):
-        # Map Tally statuses to active ones (case-insensitive)
-        active_statuses = ['PENDING', 'ACTIVE', 'QUEUED']
-        return self.status.upper() in active_statuses
+        # Only consider proposals in ACTIVE status for announcement
+        return self.status.upper() in ['ACTIVE', 'QUEUED']
+    
+    @property
+    def is_syncable(self):
+        # Proposals should be synced while NOT in a final status
+        # Final statuses indicate the proposal's voting and execution is finished
+        return self.status.upper() not in FINAL_PROPOSAL_STATUSES
 
     def get_vote_percentages(self):
         """Calculate vote percentages from vote stats"""
@@ -436,6 +523,17 @@ async def on_ready():
     global announced_proposals
     announced_proposals = load_announced_proposals()
     
+    # Sync slash commands
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
+    
+    # Update the task interval before starting
+    check_new_proposals.change_interval(minutes=SYNC_INTERVAL_MINUTES)
+    print(f"Proposal sync interval set to {SYNC_INTERVAL_MINUTES} minutes")
+    
     # Start checking for new proposals
     if not check_new_proposals.is_running():
         check_new_proposals.start()
@@ -445,71 +543,75 @@ async def fetch_wormhole_proposals():
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, fetch_wormhole_proposals_from_tally)
 
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=5)  # Initial value, will be updated in on_ready
 async def check_new_proposals():
-    """Check for new proposals every 5 minutes"""
+    """Check for new proposals and sync existing ones periodically"""
     channel = bot.get_channel(PROPOSALS_CHANNEL_ID)
     if not channel:
         print(f"Channel with ID {PROPOSALS_CHANNEL_ID} not found")
         return
 
+    # Fetch current proposals from Tally
     proposals = await fetch_wormhole_proposals()
     print(f"Found {len(proposals)} total proposals from Tally")
 
-    new_proposals = []
+    # Load proposals that need syncing
+    proposals_to_sync = load_proposals_for_sync()
+    
+    # Process all proposals
+    new_active_proposals = []
+    proposals_dict = {}
+    
     for proposal_data in proposals:
         proposal = TallyProposal(proposal_data)
-
-        # Only announce active proposals that haven't been announced yet
+        proposals_dict[proposal.id] = proposal
+        
+        # Check if this is a proposal that reached ACTIVE status and hasn't been announced
         if proposal.is_active and proposal.id not in announced_proposals:
-            new_proposals.append(proposal)
+            new_active_proposals.append(proposal)
             announced_proposals.add(proposal.id)
-            save_announced_proposal(proposal)  # Save to database
 
-    if new_proposals:
-        print(f"Found {len(new_proposals)} new active proposals to announce")
-        for proposal in new_proposals:
+    # Post new proposals that reached ACTIVE status
+    if new_active_proposals:
+        # Sort proposals by creation date to ensure proper chronological order
+        new_active_proposals.sort(key=lambda p: p.creation_date or datetime.min.replace(tzinfo=timezone.utc))
+        
+        print(f"Found {len(new_active_proposals)} new proposals that reached ACTIVE status to announce")
+        for proposal in new_active_proposals:
             embed = proposal.create_embed()
-            await channel.send(embed=embed)
+            message = await channel.send(embed=embed)
+            proposal.discord_message_id = str(message.id)
+            save_announced_proposal(proposal)  # Save with discord_message_id
             await asyncio.sleep(1)  # Small delay between messages
     else:
-        print("No new active proposals found")
+        print("No new proposals that reached ACTIVE status found")
+    
+    # Sync existing proposals
+    synced_count = 0
+    for proposal_id, sync_info in proposals_to_sync.items():
+        if proposal_id in proposals_dict:
+            proposal = proposals_dict[proposal_id]
+            
+            # Sync all proposals with embeds until they reach a final status
+            if proposal.is_syncable:
+                success = await update_proposal_embed(channel, sync_info['discord_message_id'], proposal)
+                if success:
+                    update_proposal_sync_status(proposal.id, proposal.status)
+                    synced_count += 1
+                    print(f"Updated embed for proposal {proposal.id}")
+            elif sync_info['last_status'] != proposal.status:
+                # Status changed to final (e.g., CANCELED, DEFEATED, EXECUTED, etc.), update one last time
+                success = await update_proposal_embed(channel, sync_info['discord_message_id'], proposal)
+                if success:
+                    update_proposal_sync_status(proposal.id, proposal.status)
+                    print(f"Final update for proposal {proposal.id} - status changed to {proposal.status} (sync halted)")
 
-@bot.command(name='proposals')
-async def list_proposals(ctx):
-    """List all active proposals"""
-    proposals = await fetch_wormhole_proposals()
-    active_proposals = [TallyProposal(p) for p in proposals if TallyProposal(p).is_active]
+    if synced_count > 0:
+        print(f"Synced {synced_count} existing proposal embeds")
 
-    if not active_proposals:
-        await ctx.send("No active proposals found.")
-        return
-
-    for proposal in active_proposals[:5]:
-        embed = proposal.create_embed()
-        await ctx.send(embed=embed)
-        await asyncio.sleep(1)
-
-    if len(active_proposals) > 5:
-        await ctx.send(f"And {len(active_proposals) - 5} more active proposals...")
-
-@bot.command(name='proposal')
-async def get_proposal(ctx, proposal_id: str):
-    """Get details of a specific proposal by ID"""
-    proposals = await fetch_wormhole_proposals()
-
-    for proposal_data in proposals:
-        if proposal_data.get('id') == proposal_id:
-            proposal = TallyProposal(proposal_data)
-            embed = proposal.create_embed()
-            await ctx.send(embed=embed)
-            return
-
-    await ctx.send(f"Proposal with ID {proposal_id} not found.")
-
-@bot.command(name='clear_db')
-@commands.has_permissions(administrator=True)
-async def clear_database(ctx):
+@bot.tree.command(name='clear_db', description='Clear the announced proposals database (admin only)')
+@discord.app_commands.default_permissions(administrator=True)
+async def clear_database_slash(interaction: discord.Interaction):
     """Clear the announced proposals database (admin only)"""
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
@@ -520,34 +622,7 @@ async def clear_database(ctx):
     global announced_proposals
     announced_proposals = set()
     
-    await ctx.send("Announced proposals database has been cleared.")
-
-@bot.command(name='db_stats')
-async def database_stats(ctx):
-    """Show database statistics"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM announced_proposals')
-    total_count = cursor.fetchone()[0]
-    
-    cursor.execute('''
-        SELECT COUNT(*) FROM announced_proposals 
-        WHERE date(announced_at) = date('now')
-    ''')
-    today_count = cursor.fetchone()[0]
-    
-    conn.close()
-    
-    embed = discord.Embed(
-        title="Database Statistics",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="Total Announced", value=total_count, inline=True)
-    embed.add_field(name="Announced Today", value=today_count, inline=True)
-    embed.add_field(name="In Memory", value=len(announced_proposals), inline=True)
-    
-    await ctx.send(embed=embed)
+    await interaction.response.send_message("Announced proposals database has been cleared.", ephemeral=True)
 
 # Run the bot
 if __name__ == "__main__":
