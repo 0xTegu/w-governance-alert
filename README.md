@@ -3,13 +3,13 @@
 A Discord bot that monitors Wormhole governance proposals and sends alerts to a designated channel.
 
 ## Features
-🔍 Monitors Wormhole governance proposals in real-time
-📢 Sends automatic alerts for new proposals
-📊 Shows proposal status, voting stats, and time remaining
-🔗 Direct links to view proposals on Tally
-👤 Tally API integration for proposal details
-💾 Database tracking to prevent re-announcing proposals on restart
-📝 Discord embeds that update themselves as the proposal progresses
+- 🔍 Monitors Wormhole governance proposals in real-time
+- 📢 Sends automatic alerts for new proposals
+- 📊 Shows proposal status, voting stats, and time remaining
+- 🔗 Direct links to view proposals on Tally
+- 👤 Tally API integration for proposal details
+- 💾 Database tracking to prevent re-announcing proposals on restart
+- 📝 Discord embeds that update themselves as the proposal progresses
 
 ## Requirements
 - Python 3.13 or higher
