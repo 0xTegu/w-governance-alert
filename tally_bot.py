@@ -26,7 +26,7 @@ SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', 5))  # Default to
 # Tally API configuration
 TALLY_API_URL = "https://api.tally.xyz/query"
 TALLY_API_KEY = os.getenv("TALLY_API_KEY")
-WORMHOLE_ORG_ID = "2323517483434116775"  # Wormhole organization ID on Tally
+TALLY_ORG_ID = os.getenv('TALLY_ORG_ID', '2323517483434116775')  # Wormhole organization ID on Tally
 
 intents = discord.Intents.default()
 intents.message_content = True  # Enable message content intent
@@ -235,7 +235,7 @@ def fetch_wormhole_proposals_from_tally(limit=20, status_filter=None):
     """
     
     # Build filters
-    filters = {"organizationId": WORMHOLE_ORG_ID}
+    filters = {"organizationId": TALLY_ORG_ID}
     if status_filter:
         filters["status"] = status_filter
     
